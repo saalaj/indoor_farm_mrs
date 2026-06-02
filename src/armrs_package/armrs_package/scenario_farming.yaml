@@ -1,0 +1,20 @@
+# scenario_farming.yaml
+robot_ID: [1, 2, 3, 4] # unique ID for each robot
+
+formation:
+  1: 
+    member: [1, 2, 3, 4] # Dictate the order of initialization
+    # Initial spawn coordinates for the 4 robots inside the entrance corridor (X, Y, Theta)
+    init_pos: [ 
+      [ 0.0,  0.4, 0.0], # Robot 1 (Top-Left assigned)
+      [ 0.0,  0.1, 0.0], # Robot 2 (Top-Right assigned)
+      [ 0.0, -0.1, 0.0], # Robot 3 (Bottom-Left assigned)
+      [ 0.0, -0.4, 0.0]  # Robot 4 (Bottom-Right assigned)
+    ] 
+    # Standard communication matrix connecting all 4 robots together
+    adjacency_mat: [ 
+      [0, 1, 1, 1],
+      [1, 0, 1, 1],
+      [1, 1, 0, 1],
+      [1, 1, 1, 0]
+    ]

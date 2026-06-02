@@ -1,0 +1,67 @@
+# indoor_farming_world.yaml
+Ts: 0.02 # Time sampling in second
+t_max: 50 # length of simulation time in second
+
+# look ahead distance from the center of robot
+look_ahead_ell: 0.15 
+
+LIDAR_Ts : 0.2 # Time sampling for LIDAR data
+
+# Shifting the arena boundaries so it spans from roughly x = -1 to 9, and y = -4 to 4.
+# This leaves room for the entrance on the left, exit on the right, and the crossroad in the middle.
+field : [-1.0, 9.0, -4.0, 4.0] # [xmin, xmax, ymin, ymax]
+
+obstacles:
+  # ----------------------------------------------------
+  # COMPARTMENT 1: Top-Left (Quadrant II) - WITH RIGHT DOORWAY
+  # ----------------------------------------------------
+  # Instead of a closed 4-point loop, we break the right wall.
+  # The path starts at the top-right gap, goes left, down, right, and stops at the bottom-right gap.
+  top_left_outer_wall: [
+    [3.5, 3.5, 0],  # Top-right corner of the room
+    [1.0, 3.5, 0],  # Top-left corner
+    [1.0, 1.0, 0],  # Bottom-left corner
+    [3.5, 1.0, 0]   # Bottom-right corner (Left open between y=1.0 and y=3.5)
+  ]
+  top_left_plant_row: [
+    [1.75, 2.4, 0], [2.75, 2.4, 0], [2.75, 2.1, 0], [1.75, 2.1, 0], [1.75, 2.4, 0]
+  ]
+
+  # ----------------------------------------------------
+  # COMPARTMENT 2: Top-Right (Quadrant I) - WITH LEFT DOORWAY
+  # ----------------------------------------------------
+  top_right_outer_wall: [
+    [4.5, 3.5, 0],  # Top-left corner
+    [7.0, 3.5, 0],  # Top-right corner
+    [7.0, 1.0, 0],  # Bottom-right corner
+    [4.5, 1.0, 0]   # Bottom-left corner (Left open between y=1.0 and y=3.5)
+  ]
+  top_right_plant_row: [
+    [5.25, 2.4, 0], [6.25, 2.4, 0], [6.25, 2.1, 0], [5.25, 2.1, 0], [5.25, 2.4, 0]
+  ]
+
+  # ----------------------------------------------------
+  # COMPARTMENT 3: Bottom-Left (Quadrant III) - WITH RIGHT DOORWAY
+  # ----------------------------------------------------
+  bottom_left_outer_wall: [
+    [3.5, -3.5, 0], # Bottom-right corner
+    [1.0, -3.5, 0], # Bottom-left corner
+    [1.0, -1.0, 0], # Top-left corner
+    [3.5, -1.0, 0]  # Top-right corner (Left open between y=-1.0 and y=-3.5)
+  ]
+  bottom_left_plant_row: [
+    [1.75, -2.1, 0], [2.75, -2.1, 0], [2.75, -2.4, 0], [1.75, -2.4, 0], [1.75, -2.1, 0]
+  ]
+
+  # ----------------------------------------------------
+  # COMPARTMENT 4: Bottom-Right (Quadrant IV) - WITH LEFT DOORWAY
+  # ----------------------------------------------------
+  bottom_right_outer_wall: [
+    [4.5, -3.5, 0], # Bottom-left corner
+    [7.0, -3.5, 0], # Bottom-right corner
+    [7.0, -1.0, 0], # Top-right corner
+    [4.5, -1.0, 0]  # Top-left corner (Left open between y=-1.0 and y=-3.5)
+  ]
+  bottom_right_plant_row: [
+    [5.25, -2.1, 0], [6.25, -2.1, 0], [6.25, -2.4, 0], [5.25, -2.4, 0], [5.25, -2.1, 0]
+  ]
