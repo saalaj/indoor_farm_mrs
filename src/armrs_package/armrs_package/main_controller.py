@@ -1,3 +1,4 @@
+# main_controller.py
 from .nebosim_core.range_sensing import calc_detected_pos
 from qpsolvers import Problem, solve_problem
 import numpy as np
@@ -43,7 +44,6 @@ class Estimation():
         offset = np.pi/2
         self.range_pos = calc_detected_pos(range_data, self.pos, self.theta + offset, beam_angles)
         
-        # Filter valid obstacles within sensor range limits
         valid_mask = (range_data > 0.05) & (range_data < 3.5)
         self.obs_pos = self.range_pos[valid_mask]
 
@@ -60,120 +60,125 @@ class Estimation():
 class Controller():
     def __init__(self, robot_ID, scenario_dict):
         self.robot_ID = int(robot_ID)
+        self.sim_time = 0.0 
 
-        # -----------------------------------------------------------------
-        # HARD SPLIT TOPOLOGY INTO COMPACT PAIRS
-        # -----------------------------------------------------------------
+        # =================================================================
+        # DEMO TOGGLE: Final Integration Sequence
+        # =================================================================
+        self.demo_mode = 'FINAL_INTEGRATION' 
+
         if self.robot_ID in [1, 2]:
-            # Group A (Top Half): Robot 1 only cares about 2, Robot 2 only cares about 1
             self.neigh_ids = [2] if self.robot_ID == 1 else [1]
         elif self.robot_ID in [3, 4]:
-            # Group B (Bottom Half): Robot 3 only cares about 4, Robot 4 only cares about 3
             self.neigh_ids = [4] if self.robot_ID == 3 else [3]
         else:
             self.neigh_ids = scenario_dict.get_neigh_ids(robot_ID)
 
-        # -----------------------------------------------------------------
-        # SCOPE-RESTRICTED MILESTONE SWITCHES
-        # -----------------------------------------------------------------
-        # Options: 
-        #   'COLLISION'     : Pure Nominal + Inter-Robot Avoidance
-        #   'UNKNOWN_OBS'   : Collision + LiDAR Wall Avoidance
-        #   'VCC_UNIFORM'   : Uniform Voronoi Coverage
-        #   'VCC_NON_UNIFORM': Non-Uniform Voronoi Coverage
-        #   'CONNECTIVITY'  : Path Tracking + Active Communication Link Maintenance
-        self.avoidance_mode = 'CONNECTIVITY'
+        self.avoidance_mode = 'VCC_UNIFORM'   # Final integration: uniform coverage only
 
-        # Set a safe, realistic communication range for independent pairs
-        self.R_safe = 1.6  
-        self.R_max  = 2.2  
+        # =================================================================
+        # Connectivity Parameters (DELIBERATELY LENIENT)
+        # During uniform coverage the paired drones settle on centroids that are
+        # ~3.0 m apart (e.g. R1 -> [2.5, 2.0], R2 -> [5.5, 2.0]). With a tight
+        # ceiling (the old R_max = 2.0) the tether fires its emergency pull and
+        # drags the pair back together, fighting the coverage spread and stalling
+        # them. It is loosen so connectivity acts only as a far-drift safety net:
+        # no correction during normal monitoring, just a catch if a link is about
+        # to be lost completely.
+        # =================================================================
+        self.R_safe = 3.8  
+        self.R_max  = 5.5   
 
-        # State Machine Trackers
         self.STATE_ENTRANCE = 0
         self.STATE_ENTER_ROOM = 1
         self.STATE_MONITOR_PLANTS = 2
-        self.STATE_EXIT_ROOM = 3
-        self.STATE_EXIT_ALL = 4
+        self.STATE_PAUSE = 3       # deliberate hold on the uniform centroid
+        self.STATE_EXIT = 4        # single waypoint-driven exit to the right side
+
         self.current_state = self.STATE_ENTRANCE
+        self.gate_stage = 0
+        self.exit_idx = 0          # index along the exit waypoint trail
+
         
-        # Optimized path maps ensuring cleaner entry separation
+        self.MONITOR_DURATION = 30.0
+        self.monitor_start_time = None
+
+        # Brief, deliberate hold once settled on the uniform centroid, so the
+        # uniform-coverage behaviour is clearly demonstrated before exiting.
+        self.PAUSE_DURATION = 6.0
+        self.pause_start_time = None
+
         paths_config = {
-            1: {"gate": [3.5, 2.25],  "orbit": [[3.0, 2.8], [1.5, 2.8], [1.5, 1.6], [3.0, 1.6]]},
-            2: {"gate": [4.5, 2.25],  "orbit": [[5.0, 2.8], [6.5, 2.8], [6.5, 1.6], [5.0, 1.6]]},
-            3: {"gate": [3.5, -2.25], "orbit": [[3.0, -1.6], [1.5, -1.6], [1.5, -2.8], [3.0, -2.8]]},
-            4: {"gate": [4.5, -2.25], "orbit": [[5.0, -1.6], [6.5, -1.6], [6.5, -2.8], [5.0, -2.8]]}
+            1: {"gate": [3.5, 2.25]},
+            2: {"gate": [4.5, 2.25]},
+            3: {"gate": [3.5, -2.25]},
+            4: {"gate": [4.5, -2.25]}
         }
-        
         my_config = paths_config.get(self.robot_ID, paths_config[1])
         self.gate_target = np.array(my_config["gate"])
-        self.orbit_waypoints = [np.array(wp) for wp in my_config["orbit"]]
-        self.orbit_index = 0
-        self.wp_threshold = 0.30 
-        
+        self.wp_threshold = 0.30
+
+        # =================================================================
+        # EXIT WAYPOINT TRAILS
+        # room center -> out the gate -> drop/climb into the central E-W corridor
+        # lane (y in (-1, 1)) -> straight out to the right-side exit (~x=8.5),
+        # finishing in the same vertical order they started on the left.
+        # Lanes are staggered so the four drones don't pile up at the crossroad.
+        # =================================================================
+        self.exit_paths = {
+            1: [[2.5,  2.0], [3.6,  2.0], [3.7,  0.70], [8.5,  0.70]],
+            2: [[5.5,  2.0], [4.4,  2.0], [4.3,  0.25], [8.5,  0.25]],
+            3: [[2.5, -2.0], [3.6, -2.0], [3.7, -0.70], [8.5, -0.70]],
+            4: [[5.5, -2.0], [4.4, -2.0], [4.3, -0.25], [8.5, -0.25]],
+        }
+
         self.current_goal = np.zeros(3)
 
     def compute_control_input(self, estimation_dict):
-        # -----------------------------------------------------------------
-        # DYNAMIC TOPOLOGY STATE MANAGER
-        # -----------------------------------------------------------------
-        if self.current_state == self.STATE_EXIT_ALL:
-            # Re-engage global team awareness so they can merge into a unified exit convoy
-            self.neigh_ids = [1, 2, 3, 4]
-            self.neigh_ids.remove(self.robot_ID)
-        else:
-            # Keep isolated pair-wise groupings during the entry and monitoring phases
-            if self.robot_ID in [1, 2]:
-                self.neigh_ids = [2] if self.robot_ID == 1 else [1]
-            elif self.robot_ID in [3, 4]:
-                self.neigh_ids = [4] if self.robot_ID == 3 else [3]
+        self.sim_time += 0.1 
 
-        # Force the updated neighbor structure into the communication dictionary
         estimation_dict.neigh_ids = self.neigh_ids
         current_pos = estimation_dict.lahead_pos[0:2]
-        
-        # Adjust transmission limits based on current execution needs
-        if self.current_state in [self.STATE_ENTRANCE, self.STATE_EXIT_ALL]:
-            self.R_safe, self.R_max = 1.4, 2.0
-        elif self.current_state == self.STATE_ENTER_ROOM:
-            self.R_safe, self.R_max = 1.8, 2.4
-        elif self.current_state == self.STATE_MONITOR_PLANTS:
-            self.R_safe, self.R_max = 5.0, 6.0
 
-        # Base Trajectory Guidance
-        u_nom = self.get_nominal_velocity(current_pos)
-        
-        # Coverage Overrides
+        # =================================================================
+        # FINAL INTEGRATION SEQUENCE
+        #   waypoints -> gate -> UNIFORM Voronoi coverage (MONITOR_DURATION s)
+        #   -> brief deliberate PAUSE on the centroid (PAUSE_DURATION s)
+        #   -> exit trail out to the right side.
+        # Coverage is uniform only; there is no non-uniform / emergency phase.
+        # =================================================================
+        self.avoidance_mode = 'VCC_UNIFORM'
+
         if self.current_state == self.STATE_MONITOR_PLANTS:
-            if self.avoidance_mode == 'VCC_UNIFORM':
-                u_nom = self.get_voronoi_coverage(current_pos, estimation_dict)
-            elif self.avoidance_mode == 'VCC_NON_UNIFORM':
-                u_nom = self.get_voronoi_coverage_non_uniform(current_pos, estimation_dict)
+            if self.monitor_start_time is None:
+                self.monitor_start_time = self.sim_time            # start the clock on arrival
+            elif (self.sim_time - self.monitor_start_time) >= self.MONITOR_DURATION:
+                self.current_state = self.STATE_PAUSE              # ~30 s done -> hold
+                self.pause_start_time = self.sim_time
 
-        # Consolidate Safety & Communication Vectors
+        elif self.current_state == self.STATE_PAUSE:
+            if (self.sim_time - self.pause_start_time) >= self.PAUSE_DURATION:
+                self.current_state = self.STATE_EXIT              # pause done -> leave
+                self.exit_idx = 0
+
+        if self.current_state == self.STATE_PAUSE:
+            vel_command = np.array([0.0, 0.0, 0.0])
+            self.current_goal = np.zeros(3)
+            estimation_dict.goal = self.current_goal
+            estimation_dict.vel_command = vel_command
+            return vel_command
+
+        u_nom = self.get_nominal_velocity(current_pos)
+
+        if self.current_state == self.STATE_MONITOR_PLANTS:
+            u_nom = self.get_voronoi_coverage(current_pos, estimation_dict)
+
         u_rep_robots = self.get_robot_repulsion(current_pos, estimation_dict)
-        u_rep_walls = self.get_lidar_wall_repulsion(current_pos, estimation_dict)
-        u_conn = self.get_connectivity_maintenance(current_pos, estimation_dict)
+        u_rep_walls  = self.get_lidar_wall_repulsion(current_pos, estimation_dict)
+        u_conn       = self.get_connectivity_maintenance(current_pos, estimation_dict)
 
-        # Merge execution velocities
         u_total = u_nom + u_rep_robots + u_rep_walls + u_conn
         
-        # -----------------------------------------------------------------
-        # DEADLOCK BREAKOUT LAYER (Resolves Multi-Agent Doorway / Local Minima Traps)
-        # -----------------------------------------------------------------
-        # Detect if the robot is active but local potential fields have pinned it to a standstill
-        dist_to_goal = np.linalg.norm(current_pos - self.get_nominal_velocity(current_pos))
-        if np.linalg.norm(u_total) < 0.03 and self.current_state != self.STATE_EXIT_ALL:
-            if self.robot_ID % 2 == 0:
-                nudge = np.array([0.08, -0.04])
-            else:
-                nudge = np.array([-0.04, 0.08])
-                
-            if self.current_state in [self.STATE_ENTER_ROOM, self.STATE_EXIT_ROOM, self.STATE_ENTRANCE]:
-                u_total += nudge
-
-        # -----------------------------------------------------------------
-        # SPEED LIMITER & BOUNDING
-        # -----------------------------------------------------------------
         vx, vy = 1.1 * u_total[0], 1.1 * u_total[1]
         max_speed = 0.35
         speed = np.hypot(vx, vy)
@@ -189,84 +194,56 @@ class Controller():
         
         return vel_command
 
-    # -----------------------------------------------------------------
-    # NOMINAL PATH TRACKING LOGIC (MILESTONE 1)
-    # -----------------------------------------------------------------
     def get_nominal_velocity(self, current_pos):
         u_nom = np.array([0.0, 0.0])
-        
         speed_multiplier = 0.35 if self.robot_ID in [1, 3] else 0.22
 
         if self.current_state == self.STATE_ENTRANCE:
             hall_x = 4.0 if self.robot_ID in [1, 3] else 4.5
             target = np.array([hall_x, 0.0])
             u_nom = target - current_pos
-            
-            if np.linalg.norm(target - current_pos) < 0.25:
+            if np.linalg.norm(u_nom) < 0.25:
                 self.current_state = self.STATE_ENTER_ROOM
-                self.gate_stage = 0 
+                self.gate_stage = 0  
 
         elif self.current_state == self.STATE_ENTER_ROOM:
             speed_multiplier = 0.28
-            
             if self.gate_stage == 0:
                 prep_target = np.array([self.gate_target[0], 0.0])
                 u_nom = prep_target - current_pos
-                # Require a tighter tolerance so they line up perfectly before turning
-                if np.linalg.norm(prep_target - current_pos) < 0.15:
+                if np.linalg.norm(u_nom) < 0.15:
                     self.gate_stage = 1
-            
             else:
                 u_nom = self.gate_target - current_pos
-                if np.linalg.norm(self.gate_target - current_pos) < self.wp_threshold:
+                if np.linalg.norm(u_nom) < self.wp_threshold:
                     self.current_state = self.STATE_MONITOR_PLANTS
 
         elif self.current_state == self.STATE_MONITOR_PLANTS:
-            target = self.orbit_waypoints[self.orbit_index]
-            u_nom = target - current_pos
-            speed_multiplier = 0.28
-            
-            if np.linalg.norm(target - current_pos) < self.wp_threshold:
-                self.orbit_index += 1
-                if self.orbit_index >= len(self.orbit_waypoints):
-                    self.current_state = self.STATE_EXIT_ROOM
-                    self.exit_stage = 0  # Initialize the exit alignment handler
+            u_nom = np.array([0.0, 0.0])
 
-        elif self.current_state == self.STATE_EXIT_ROOM:
-            speed_multiplier = 0.25
-            
-            if self.exit_stage == 0:
-                escape_gate = np.array([self.gate_target[0], 0.0])
-                u_nom = escape_gate - current_pos
-                
-                if np.linalg.norm(escape_gate - current_pos) < 0.15:
-                    self.exit_stage = 1
-            
+        elif self.current_state == self.STATE_EXIT:
+            speed_multiplier = 0.35
+            path = self.exit_paths.get(self.robot_ID, self.exit_paths[1])
+            target = np.array(path[self.exit_idx])
+            u_nom = target - current_pos
+            dist = np.linalg.norm(u_nom)
+
+            if self.exit_idx < len(path) - 1:
+                if dist < 0.30:                 # reached a waypoint -> advance
+                    self.exit_idx += 1
             else:
-                self.current_state = self.STATE_EXIT_ALL
+                if dist < 0.20:                 # reached the final exit point -> stop
+                    speed_multiplier = 0.0
 
-        elif self.current_state == self.STATE_EXIT_ALL:
-            target = np.array([8.3, 0.0])
-            u_nom = target - current_pos
-            speed_multiplier = 0.25
-            
-            if np.linalg.norm(target - current_pos) < self.wp_threshold:
-                u_nom = np.array([0.0, 0.0])
-
-        # Apply vector normalization and scaling
         norm_nom = np.linalg.norm(u_nom)
         if norm_nom > 0.001:
             u_nom = (u_nom / norm_nom) * speed_multiplier
         return u_nom
 
-    # -----------------------------------------------------------------
-    # INTER-ROBOT APF REPULSION 
-    # -----------------------------------------------------------------
     def get_robot_repulsion(self, current_pos, estimation_dict):
         u_rep_robots = np.array([0.0, 0.0])
         d_safe_robot = 0.32  
         k_rep_robot = 0.20   
-        
         for neigh_id in self.neigh_ids:
             if neigh_id in estimation_dict.neighbours_data and 'lahead' in estimation_dict.neighbours_data[neigh_id]:
                 neigh_pos = estimation_dict.neighbours_data[neigh_id]['lahead'][0:2]
@@ -276,147 +253,81 @@ class Controller():
                     u_rep_robots += k_rep_robot * (1.0/dist - 1.0/d_safe_robot) * (1.0/(dist**2)) * (v_dist / dist)
         return u_rep_robots
 
-    # -----------------------------------------------------------------
-    # SENSOR-BASED WALL REPULSION 
-    # -----------------------------------------------------------------
     def get_lidar_wall_repulsion(self, current_pos, estimation_dict):
         u_rep_walls = np.array([0.0, 0.0])
         d_safe_wall = 0.28   
         k_rep_wall = 0.12    
-        
         if estimation_dict.obs_pos is not None and len(estimation_dict.obs_pos) > 0:
             obs_xy = estimation_dict.obs_pos[:, 0:2]
             for obs in obs_xy:
                 v_dist = current_pos - obs
                 dist = np.linalg.norm(v_dist)
-                
                 if dist < d_safe_wall and dist > 0.01:
                     u_rep_walls += k_rep_wall * (1.0/dist - 1.0/d_safe_wall) * (1.0/(dist**2)) * (v_dist / dist)
         return u_rep_walls
     
-    # -----------------------------------------------------------------
-    # VORONOI-BASED COVERAGE CONTROL METHOD
-    # -----------------------------------------------------------------
     def get_voronoi_coverage(self, current_pos, estimation_dict):
-        """
-        Computes a bounded Voronoi coverage control vector to distribute 
-        the robots uniformly over their designated plot spaces.
-        """
         u_cov = np.array([0.0, 0.0])
-        
-        # Define the physical boundaries of each robot's plot area
-        # Format: [xmin, xmax, ymin, ymax] matching your map layout coordinates
-        plot_bounds = {
-            1: [1.0, 4.0,  1.0, 3.0],  # Top-Left Room
-            2: [4.0, 7.0,  1.0, 3.0],  # Top-Right Room
-            3: [1.0, 4.0, -3.0, -1.0], # Bottom-Left Room
-            4: [4.0, 7.0, -3.0, -1.0]  # Bottom-Right Room
-        }
-        
+        plot_bounds = {1: [1.0, 4.0, 1.0, 3.0], 2: [4.0, 7.0, 1.0, 3.0], 3: [1.0, 4.0, -3.0, -1.0], 4: [4.0, 7.0, -3.0, -1.0]}
         bounds = plot_bounds.get(self.robot_ID, [1.0, 4.0, 1.0, 3.0])
         xmin, xmax, ymin, ymax = bounds
 
-        # Collect the positions of all active tracking participants
-        # Include this robot's position and all communicated neighbor positions
         active_positions = {self.robot_ID: current_pos}
-        
         for neigh_id in self.neigh_ids:
             if neigh_id in estimation_dict.neighbours_data:
                 active_positions[neigh_id] = estimation_dict.neighbours_data[neigh_id]['lahead'][0:2]
 
-        # Discretized Grid Sampling to calculate the Centroid
-        resolution = 0.15  # Distance spacing between sampling points (meters)
+        resolution = 0.15  
         x_space = np.arange(xmin, xmax, resolution)
         y_space = np.arange(ymin, ymax, resolution)
         
-        sum_x = 0.0
-        sum_y = 0.0
-        points_in_cell = 0
+        sum_x, sum_y, points_in_cell = 0.0, 0.0, 0
 
         for gx in x_space:
             for gy in y_space:
                 grid_point = np.array([gx, gy])
-                
-                # Find which active robot ID is closest to this specific grid point
-                closest_id = None
-                min_dist = float('inf')
-                
+                closest_id, min_dist = None, float('inf')
                 for r_id, r_pos in active_positions.items():
                     dist = np.linalg.norm(grid_point - r_pos)
                     if dist < min_dist:
                         min_dist = dist
                         closest_id = r_id
                 
-                # If this robot is the closest owner, accumulate the point into its Voronoi mass
                 if closest_id == self.robot_ID:
                     sum_x += gx
                     sum_y += gy
                     points_in_cell += 1
 
-        # Compute Centroid and apply proportional tracking force
         if points_in_cell > 0:
             centroid = np.array([sum_x / points_in_cell, sum_y / points_in_cell])
-            
-            # Control law driving vector toward the center of mass
-            k_cover = 0.65
-            u_cov = k_cover * (centroid - current_pos)
-            
+            u_cov = 0.65 * (centroid - current_pos)
         return u_cov
     
-    # Non-Uniform Density Centroid Calculation Update:
-    # -----------------------------------------------------------------
     def get_voronoi_coverage_non_uniform(self, current_pos, estimation_dict):
-        """
-        Computes a bounded non-uniform Voronoi coverage control vector 
-        to deploy the robot toward a specific high-priority hotspot inside its room.
-        """
+        # NOTE: not used in the final integration (uniform coverage only).
+        # Kept here for reference / Approach #4.
         u_cov = np.array([0.0, 0.0])
-        
-        plot_bounds = {
-            1: [1.0, 4.0,  1.0, 3.0],  # Room 1: Top-Left
-            2: [4.0, 7.0,  1.0, 3.0],  # Room 2: Top-Right
-            3: [1.0, 4.0, -3.0, -1.0], # Room 3: Bottom-Left
-            4: [4.0, 7.0, -3.0, -1.0]  # Room 4: Bottom-Right
-        }
-        
-        # Fetch bounds for this specific robot ID (default to Room 1 if not found)
+        plot_bounds = {1: [1.0, 4.0, 1.0, 3.0], 2: [4.0, 7.0, 1.0, 3.0], 3: [1.0, 4.0, -3.0, -1.0], 4: [4.0, 7.0, -3.0, -1.0]}
         bounds = plot_bounds.get(self.robot_ID, [1.0, 4.0, 1.0, 3.0])
         xmin, xmax, ymin, ymax = bounds
 
-        # Assign the target priority "Hotspot" coordinate inside each room
-        room_hotspots = {
-            1: np.array([2.0, 2.0]),   
-            2: np.array([6.0, 2.0]),   
-            3: np.array([2.0, -2.0]),  
-            4: np.array([6.0, -2.0])   
-        }
+        room_hotspots = {1: np.array([1.5, 1.5]), 2: np.array([6.5, 1.5]), 3: np.array([1.5, -1.5]), 4: np.array([6.5, -1.5])}
         hotspot = room_hotspots.get(self.robot_ID, np.array([2.0, 2.0]))
 
-        # Safely collect positions of all tracking participants over the network
         active_positions = {self.robot_ID: current_pos}
         for neigh_id in self.neigh_ids:
             if neigh_id in estimation_dict.neighbours_data and 'lahead' in estimation_dict.neighbours_data[neigh_id]:
                 active_positions[neigh_id] = estimation_dict.neighbours_data[neigh_id]['lahead'][0:2]
 
-        # Generate the full discrete sample spaces using an explicit step size (meters)
         resolution = 0.15  
         x_space = np.arange(xmin, xmax, resolution)
         y_space = np.arange(ymin, ymax, resolution)
-        
-        # Initialize mass summation variables for Center of Mass tracking
-        sum_weighted_x = 0.0
-        sum_weighted_y = 0.0
-        total_mass = 0.0 
+        sum_weighted_x, sum_weighted_y, total_mass = 0.0, 0.0, 0.0 
 
-        # Evaluate the custom density distribution across the grid cells
         for gx in x_space:
             for gy in y_space:
                 grid_point = np.array([gx, gy])
-                
-                # Voronoi Territory Check: Who is closest to this point?
-                closest_id = None
-                min_dist = float('inf')
-                
+                closest_id, min_dist = None, float('inf')
                 for r_id, r_pos in active_positions.items():
                     if r_pos is not None:
                         dist = np.linalg.norm(grid_point - r_pos)
@@ -425,53 +336,46 @@ class Controller():
                             closest_id = r_id
                 
                 if closest_id == self.robot_ID:
-                    # Mathematical Gaussian Density Function: phi(q)
-                    # Points closer to the hotspot yield a higher weight factor (phi)
                     dist_to_hotspot = np.linalg.norm(grid_point - hotspot)
-                    phi = np.exp(-0.5 * (dist_to_hotspot / 1.0)**2) + 0.1 
-                    
-                    # Accumulate position values multiplied by their local importance weight
+                    phi = 100.0 * np.exp(-0.5 * (dist_to_hotspot / 0.4)**2) + 0.01 
                     sum_weighted_x += gx * phi
                     sum_weighted_y += gy * phi
                     total_mass += phi
 
         if total_mass > 0:
             centroid = np.array([sum_weighted_x / total_mass, sum_weighted_y / total_mass])
-            k_cover = 0.65
-            u_cov = k_cover * (centroid - current_pos)
+            u_cov = 0.65 * (centroid - current_pos)
         else:
             room_center = np.array([(xmin + xmax)/2.0, (ymin + ymax)/2.0])
             u_cov = 0.35 * (room_center - current_pos)
-            
         return u_cov
     
-    # -----------------------------------------------------------------
-    # POTENTIAL-BASED CONNECTIVITY MAINTENANCE
-    # -----------------------------------------------------------------
     def get_connectivity_maintenance(self, current_pos, estimation_dict):
-        """
-        Computes an attractive potential field vector pulling the robot back 
-        toward its assigned neighbors if their distance approaches R_max.
-        """
         u_conn = np.array([0.0, 0.0])
-        k_conn = 0.45  
+        k_conn = 0.3   # gentle attraction (lenient, so it never fights coverage)
+        
+        # =================================================================
+        # During the exit run, fully relax the leash so paired drones can take
+        # their separate lanes to the right without dragging each other.
+        # =================================================================
+        current_R_safe = self.R_safe
+        current_R_max = self.R_max
+        
+        if self.current_state == self.STATE_EXIT:
+            current_R_max = 12.0
         
         for neigh_id in self.neigh_ids:
             if neigh_id in estimation_dict.neighbours_data and 'lahead' in estimation_dict.neighbours_data[neigh_id]:
                 neigh_pos = estimation_dict.neighbours_data[neigh_id]['lahead'][0:2]
-                
-                v_dist = neigh_pos - current_pos  
+                v_dist = neigh_pos - current_pos 
                 dist = np.linalg.norm(v_dist)
                 
-                if dist > self.R_safe and dist < self.R_max:
-                    denom = max(self.R_max - dist, 0.02)
-                    pull_magnitude = (dist - self.R_safe) / denom
-                    
-                    u_conn += k_conn * pull_magnitude * (v_dist / dist)
-                    
-                elif dist >= self.R_max:
-                    u_conn += 1.2 * (v_dist / dist)
-                    
+                if dist > current_R_safe:
+                    if dist >= current_R_max - 0.05:
+                        pull_strength = 5.0
+                    else:
+                        pull_strength = k_conn * (dist - current_R_safe) / ((current_R_max - dist)**2)
+                    u_conn += pull_strength * (v_dist / dist)
         return u_conn
 
     @staticmethod

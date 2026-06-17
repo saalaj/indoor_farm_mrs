@@ -10,7 +10,7 @@ from functools import partial
 import os
 import numpy as np
 from scipy.spatial import Voronoi, QhullError 
-from matplotlib.patches import Polygon
+from matplotlib.patches import Polygon, Circle 
 from matplotlib.path import Path  
 
 from .yaml_loader import ParamLoader, ScenarioLoader
@@ -28,11 +28,8 @@ class Computation(Node):
     def __init__(self, ROS_NODE_NAME):
         super().__init__(ROS_NODE_NAME)
         
-        # =================================================================
-        # VISUALIZER MODE TOGGLE:
-        # Options: 'UNIFORM' or 'NON_UNIFORM'
-        # =================================================================
-        self.density_mode = 'NON_UNIFORM' 
+        self.demo_mode = 'FINAL_INTEGRATION' 
+        self.density_mode = 'UNIFORM' 
         
         self.declare_parameter('param_yaml', '')
         self.declare_parameter('scenario_yaml', '')
@@ -49,15 +46,14 @@ class Computation(Node):
         self.plot_vis = PlotVisualizer(param, scenario)
         self.evaluator = CentralizedEvaluator(scenario)
 
-        # Plotting Caches
         self._custom_com_lines = {}
         self._voronoi_patches = {}
         self._centroid_markers = {}
         self._centroid_lines = {}
+        self._emergency_visuals = {}
         
         self.plot_vis.SHOW_COMMUNICATION = False 
 
-        # Draw static obstacles
         for key in param.obstacles:
             obj_vertices = param.obstacles[key]
             self.plot_vis.ax_2D.plot(obj_vertices[:, 0], obj_vertices[:, 1], 'k')
@@ -127,25 +123,47 @@ class Computation(Node):
         if diff > (1.1 * self.Ts):
             pass 
         self.check_t = now
-
         self.plot_vis.SHOW_COMMUNICATION = False
-
-        in_rooms = True
-        for r_id in [1, 2, 3, 4]:
-            if r_id in self.robot_est and self.robot_est[r_id].pos is not None:
-                if self.robot_est[r_id].pos[0] < 3.8:
-                    in_rooms = False
-                    break
-        r_max = 3.8 if in_rooms else 2.0
 
         elapsed_time = (now - self.start_t)
         self.plot_vis.update(elapsed_time, self.robot_est, self.evaluator)
 
+        # =================================================================
+        # FINAL INTEGRATION (visualizer): coverage is UNIFORM the whole time.
+        # The single emergency marker drawn below is purely illustrative -- the
+        # drones stay on their geometric centroids and never converge on it.
+        # =================================================================
+        self.density_mode = 'UNIFORM'
+
         if hasattr(self.plot_vis, 'ax_2D') and self.plot_vis.ax_2D is not None:
             
-            # =================================================================
-            # CONNECTIVITY TETHER LINES
-            # =================================================================
+            room_hotspots = {1: np.array([1.5, 1.5]), 2: np.array([6.5, 1.5]), 3: np.array([1.5, -1.5]), 4: np.array([6.5, -1.5])}
+
+            # -------------------------------------------------------------
+            # SINGLE illustrative EMERGENCY hotspot.
+            # Because coverage stays uniform, the responsible drone holds its
+            # geometric centroid (~[2.5, 2.0]) and visibly does NOT rush to this
+            # corner -- which is exactly the point of the demo.
+            # -------------------------------------------------------------
+            EMERGENCY_SPOT = np.array([1.5, 1.5])   # deep corner of the top-left room
+            EMERGENCY_APPEAR_T = 20.0               # show once the drones are monitoring
+
+            if elapsed_time >= EMERGENCY_APPEAR_T:
+                if 'spot' not in self._emergency_visuals:
+                    circle = Circle((EMERGENCY_SPOT[0], EMERGENCY_SPOT[1]), radius=0.6,
+                                    color='red', alpha=0.25, zorder=1)
+                    self.plot_vis.ax_2D.add_patch(circle)
+                    marker, = self.plot_vis.ax_2D.plot([EMERGENCY_SPOT[0]], [EMERGENCY_SPOT[1]],
+                                    marker='x', color='darkred', markersize=12,
+                                    markeredgewidth=3.0, zorder=2)
+                    label = self.plot_vis.ax_2D.text(EMERGENCY_SPOT[0], EMERGENCY_SPOT[1] + 0.75,
+                                    'EMERGENCY', color='darkred', fontsize=9,
+                                    ha='center', va='bottom', fontweight='bold', zorder=3)
+                    self._emergency_visuals['spot'] = (circle, marker, label)
+                else:
+                    for artist in self._emergency_visuals['spot']:
+                        artist.set_visible(True)
+
             all_possible_pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
             for r1_id, r2_id in all_possible_pairs:
                 pair_key = (r1_id, r2_id)
@@ -154,16 +172,14 @@ class Computation(Node):
                 if r1_id in self.robot_est and r2_id in self.robot_est:
                     est1 = self.robot_est[r1_id]
                     est2 = self.robot_est[r2_id]
-
                     if est1.pos is not None and est2.pos is not None:
                         dist = np.linalg.norm(est1.pos[0:2] - est2.pos[0:2])
                         is_same_group = (r1_id in [1, 2] and r2_id in [1, 2]) or (r1_id in [3, 4] and r2_id in [3, 4])
-                        show_link = (is_same_group and dist <= r_max) if not in_rooms else (dist <= r_max)
+                        show_link = (is_same_group and dist <= 2.0)
 
                 if show_link:
                     x_data = [self.robot_est[r1_id].pos[0], self.robot_est[r2_id].pos[0]]
                     y_data = [self.robot_est[r1_id].pos[1], self.robot_est[r2_id].pos[1]]
-
                     if pair_key in self._custom_com_lines:
                         self._custom_com_lines[pair_key].set_data(x_data, y_data)
                         self._custom_com_lines[pair_key].set_visible(True)
@@ -174,22 +190,8 @@ class Computation(Node):
                     if pair_key in self._custom_com_lines:
                         self._custom_com_lines[pair_key].set_visible(False)
 
-            # =================================================================
-            # BOUNDED VORONOI COVERAGE CELLS & CENTROIDS
-            # =================================================================
-            b_xmin, b_xmax = -1.0, 9.0
-            b_ymin, b_ymax = -4.0, 4.0
-            
-            room_hotspots = {
-                1: np.array([2.0, 2.0]),   
-                2: np.array([6.0, 2.0]),   
-                3: np.array([2.0, -2.0]),  
-                4: np.array([6.0, -2.0])   
-            }
-            
-            robot_positions = []
-            active_ids = []
-            
+            b_xmin, b_xmax, b_ymin, b_ymax = -1.0, 9.0, -4.0, 4.0
+            robot_positions, active_ids = [], []
             for id, est in self.robot_est.items():
                 if est.pos is not None:
                     robot_positions.append(est.pos[:2]) 
@@ -198,17 +200,10 @@ class Computation(Node):
             active_vor_ids = set()
             
             if len(robot_positions) >= 2:
-                region_colors = {
-                    1: '#1f77b4',  
-                    2: '#2ca02c',  
-                    3: '#d62728',  
-                    4: '#ff7f0e'   
-                }
-
+                region_colors = {1: '#1f77b4', 2: '#2ca02c', 3: '#d62728', 4: '#ff7f0e'}
                 try:
                     pts = list(robot_positions)
                     for rx, ry in robot_positions:
-                        # 8-Point Mirroring safely seals all walls AND corners
                         pts.append([2 * b_xmin - rx, ry]) 
                         pts.append([2 * b_xmax - rx, ry]) 
                         pts.append([rx, 2 * b_ymin - ry]) 
@@ -224,14 +219,12 @@ class Computation(Node):
                     for i, r_id in enumerate(active_ids):
                         region_idx = vor.point_region[i]
                         region = vor.regions[region_idx]
-                        
                         c = region_colors.get(r_id, 'gray')
                         
                         if -1 not in region and len(region) > 0:
                             verts = np.array([vor.vertices[v] for v in region])
                             active_vor_ids.add(r_id)
                             
-                            # --- Render Polygon ---
                             if r_id in self._voronoi_patches:
                                 self._voronoi_patches[r_id].set_xy(verts)
                                 self._voronoi_patches[r_id].set_facecolor(c)
@@ -242,13 +235,11 @@ class Computation(Node):
                                 self.plot_vis.ax_2D.add_patch(poly)
                                 self._voronoi_patches[r_id] = poly
 
-                            # --- Calculate Unified Grid Centroid ---
                             vx_min, vx_max = np.min(verts[:, 0]), np.max(verts[:, 0])
                             vy_min, vy_max = np.min(verts[:, 1]), np.max(verts[:, 1])
                             
                             resolution = 0.15
-                            xx, yy = np.meshgrid(np.arange(vx_min, vx_max, resolution), 
-                                                 np.arange(vy_min, vy_max, resolution))
+                            xx, yy = np.meshgrid(np.arange(vx_min, vx_max, resolution), np.arange(vy_min, vy_max, resolution))
                             grid_points = np.c_[xx.ravel(), yy.ravel()]
                             
                             poly_path = Path(verts)
@@ -256,13 +247,12 @@ class Computation(Node):
                             valid_points = grid_points[inside_mask]
                             
                             if len(valid_points) > 0:
-                                # Apply the math based on the mode toggle
                                 if self.density_mode == 'UNIFORM':
                                     phis = np.ones(len(valid_points))
                                 elif self.density_mode == 'NON_UNIFORM':
                                     hotspot = room_hotspots.get(r_id, np.array([2.0, 2.0]))
                                     dists = np.linalg.norm(valid_points - hotspot, axis=1)
-                                    phis = np.exp(-0.5 * (dists / 1.0)**2) + 0.1
+                                    phis = 100.0 * np.exp(-0.5 * (dists / 0.4)**2) + 0.01
                                     
                                 total_mass = np.sum(phis)
                                 cx = np.sum(valid_points[:, 0] * phis) / total_mass
@@ -270,7 +260,6 @@ class Computation(Node):
                             else:
                                 cx, cy = np.mean(verts, axis=0) 
 
-                            # --- Render Centroid Marker (Star) ---
                             if r_id in self._centroid_markers:
                                 self._centroid_markers[r_id].set_data([cx], [cy])
                                 self._centroid_markers[r_id].set_color(c)
@@ -279,7 +268,6 @@ class Computation(Node):
                                 marker, = self.plot_vis.ax_2D.plot([cx], [cy], marker='*', color=c, markersize=10, zorder=3)
                                 self._centroid_markers[r_id] = marker
 
-                            # --- Render VCC Pull Vector ---
                             rx, ry = robot_positions[i]
                             if r_id in self._centroid_lines:
                                 self._centroid_lines[r_id].set_data([rx, cx], [ry, cy])
@@ -288,7 +276,6 @@ class Computation(Node):
                             else:
                                 line, = self.plot_vis.ax_2D.plot([rx, cx], [ry, cy], linestyle='--', color=c, alpha=0.8, linewidth=1.5, zorder=2)
                                 self._centroid_lines[r_id] = line
-                                
                 except (QhullError, Exception):
                     pass 
 
